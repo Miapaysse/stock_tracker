@@ -312,11 +312,10 @@ class FirestoreStockService extends ChangeNotifier {
       maxStock: maxStock,
     );
 
-    // Actualización optimista local + guardado en Firestore
     _parts.add(newPart);
     notifyListeners();
 
-    _db.collection('parts').doc(cleanPn).set({
+    _db.collection('parts').doc(cleanPn.replaceAll('/', '_')).set({
       'partNumber': cleanPn,
       'description': description.trim(),
       'compatibleModels': compatibleModels,
@@ -344,6 +343,67 @@ class FirestoreStockService extends ChangeNotifier {
       minStock: minStock,
       maxStock: maxStock,
     );
+  }
+
+  /// Importación masiva de Catálogo Maestro (P/N verificados) desde Excel
+  Future<int> importCatalogPartsFromExcel(List<Part> importedParts) async {
+    if (_currentUser.role == UserRole.technician) {
+      throw Exception('Permiso denegado: Los técnicos no pueden importar catálogo.');
+    }
+
+    WriteBatch batch = _db.batch();
+    int opCount = 0;
+
+    for (var item in importedParts) {
+      final cleanPn = item.partNumber.trim().toUpperCase();
+      if (cleanPn.isEmpty) continue;
+
+      final docId = cleanPn.replaceAll('/', '_');
+      final docRef = _db.collection('parts').doc(docId);
+
+      final existingIndex = _parts.indexWhere((p) => p.partNumber.toUpperCase() == cleanPn);
+
+      if (existingIndex != -1) {
+        // Reemplazamos compatibleModels por los limpios del Excel sin tocar min/max stock
+        batch.set(
+          docRef,
+          {
+            'partNumber': cleanPn,
+            if (item.description.isNotEmpty) 'description': item.description,
+            'compatibleModels': item.compatibleModels,
+          },
+          SetOptions(merge: true),
+        );
+      } else {
+        batch.set(
+          docRef,
+          {
+            'partNumber': cleanPn,
+            'description': item.description,
+            'compatibleModels': item.compatibleModels,
+            'minStock': 0,
+            'maxStock': 0,
+            'safeTimeDays': 60,
+            'timesTouchedMin': 0,
+            'timesTouchedMax': 0,
+          },
+          SetOptions(merge: true),
+        );
+      }
+
+      opCount++;
+      if (opCount >= 400) {
+        await batch.commit();
+        batch = _db.batch();
+        opCount = 0;
+      }
+    }
+
+    if (opCount > 0) {
+      await batch.commit();
+    }
+
+    return importedParts.length;
   }
 
   // --- 2. INGRESO DE STOCK EN CAJÓN ---
@@ -516,7 +576,6 @@ class FirestoreStockService extends ChangeNotifier {
       throw Exception('Permiso denegado.');
     }
 
-    // Borrar anteriores y cargar los nuevos en lotes de 400 (límite de Firestore es 500 por batch)
     final existing = await _db.collection('new_stock').get();
     WriteBatch batch = _db.batch();
     int opCount = 0;

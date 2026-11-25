@@ -2,9 +2,11 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:excel/excel.dart' hide Border;
-import 'package:stock_tracker/services/firestore_stock_service.dart';
+import 'package:spreadsheet_decoder/spreadsheet_decoder.dart';
 import '../models/user_role.dart';
 import '../models/new_stock_item.dart';
+import '../models/part.dart';
+import '../services/firestore_stock_service.dart';
 
 class AdminPanelScreen extends StatefulWidget {
   final FirestoreStockService stockService;
@@ -20,7 +22,8 @@ class _AdminPanelScreenState extends State<AdminPanelScreen> {
   final _descCatalogController = TextEditingController();
   final _modelCatalogController = TextEditingController();
 
-  bool _isUploading = false;
+  bool _isUploadingCatalog = false;
+  bool _isUploadingNewStock = false;
   bool _isExporting = false;
 
   @override
@@ -31,19 +34,20 @@ class _AdminPanelScreenState extends State<AdminPanelScreen> {
     super.dispose();
   }
 
-  /// Carga de Excel "Stock Nuevos" (Tango ERP)
-  Future<void> _pickAndParseExcel() async {
-    setState(() => _isUploading = true);
+  /// Carga masiva de Catálogo Maestro con formato estándar:
+  /// Columna A: PN | Columna B: DESCRIPCION | Columna C: MODELOS (separados por coma)
+  Future<void> _pickAndImportCatalogExcel() async {
+    setState(() => _isUploadingCatalog = true);
 
     try {
-      final result = await FilePicker.platform.pickFiles(
+      final result = await FilePicker.pickFiles(
         type: FileType.custom,
         allowedExtensions: ['xlsx', 'xls'],
         withData: true,
       );
 
       if (result == null || result.files.isEmpty) {
-        setState(() => _isUploading = false);
+        setState(() => _isUploadingCatalog = false);
         return;
       }
 
@@ -52,11 +56,119 @@ class _AdminPanelScreenState extends State<AdminPanelScreen> {
         throw Exception('No se pudieron leer los datos del archivo.');
       }
 
-      final excel = Excel.decodeBytes(fileBytes);
+      final decoder = SpreadsheetDecoder.decodeBytes(fileBytes, update: false);
+      final Map<String, Part> parsedParts = {};
+
+      for (var table in decoder.tables.keys) {
+        final sheet = decoder.tables[table];
+        if (sheet == null || sheet.maxRows < 2) continue;
+
+        final headerRow = sheet.rows[0];
+        int colPN = -1;
+        int colDesc = -1;
+        int colModelos = -1;
+
+        for (int j = 0; j < headerRow.length; j++) {
+          final val = (headerRow[j]?.toString() ?? '').trim().toUpperCase();
+          if (val == 'PN') colPN = j;
+          if (val == 'DESCRIPCION' || val == 'DESCRIPCIÓN') colDesc = j;
+          if (val == 'MODELOS' || val == 'MODELO') colModelos = j;
+        }
+
+        if (colPN == -1 || colDesc == -1 || colModelos == -1) continue;
+
+        for (int i = 1; i < sheet.maxRows; i++) {
+          final row = sheet.rows[i];
+          if (row.isEmpty) continue;
+
+          final rawPn = (colPN < row.length)
+              ? (row[colPN]?.toString() ?? '').trim().toUpperCase()
+              : '';
+          if (rawPn.isEmpty) continue;
+
+          final desc = (colDesc < row.length)
+              ? (row[colDesc]?.toString() ?? '').trim()
+              : '';
+
+          final rawModelos = (colModelos < row.length)
+              ? (row[colModelos]?.toString() ?? '').trim()
+              : '';
+
+          final modelsList = rawModelos
+              .split(',')
+              .map((m) => m.trim())
+              .where((m) => m.isNotEmpty)
+              .toSet()
+              .toList();
+
+          parsedParts[rawPn] = Part(
+            id: rawPn,
+            partNumber: rawPn,
+            description: desc.isNotEmpty ? desc : 'Sin descripción',
+            compatibleModels: modelsList,
+          );
+        }
+      }
+
+      if (parsedParts.isNotEmpty) {
+        final count = await widget.stockService.importCatalogPartsFromExcel(
+          parsedParts.values.toList(),
+        );
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('✓ Se importaron $count Part Numbers con sus modelos en Firebase.'),
+            backgroundColor: Colors.green,
+          ),
+        );
+      } else {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('El archivo debe tener las columnas exactas: PN, DESCRIPCION, MODELOS en la fila 1.'),
+            backgroundColor: Colors.orange,
+          ),
+        );
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Error al importar catálogo: $e'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _isUploadingCatalog = false);
+    }
+  }
+
+  /// Carga de Excel "Stock Nuevos" (Tango ERP)
+  Future<void> _pickAndParseExcel() async {
+    setState(() => _isUploadingNewStock = true);
+
+    try {
+      final result = await FilePicker.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: ['xlsx', 'xlsm', 'xls'],
+        withData: true,
+      );
+
+      if (result == null || result.files.isEmpty) {
+        setState(() => _isUploadingNewStock = false);
+        return;
+      }
+
+      final fileBytes = result.files.first.bytes;
+      if (fileBytes == null) {
+        throw Exception('No se pudieron leer los datos del archivo.');
+      }
+
+      final decoder = SpreadsheetDecoder.decodeBytes(fileBytes, update: false);
       final List<NewStockItem> parsedItems = [];
 
-      for (var table in excel.tables.keys) {
-        final sheet = excel.tables[table];
+      for (var table in decoder.tables.keys) {
+        final sheet = decoder.tables[table];
         if (sheet == null) continue;
 
         int headerRowIndex = -1;
@@ -70,7 +182,7 @@ class _AdminPanelScreenState extends State<AdminPanelScreen> {
         for (int i = 0; i < sheet.maxRows; i++) {
           final row = sheet.rows[i];
           for (int j = 0; j < row.length; j++) {
-            final val = row[j]?.value?.toString().trim() ?? '';
+            final val = (row[j]?.toString() ?? '').trim();
             if (val == 'Artículo') {
               headerRowIndex = i;
               colArticulo = j;
@@ -96,35 +208,35 @@ class _AdminPanelScreenState extends State<AdminPanelScreen> {
           if (row.isEmpty) continue;
 
           final partNumber = (colArticulo != -1 && colArticulo < row.length)
-              ? row[colArticulo]?.value?.toString().trim() ?? ''
+              ? (row[colArticulo]?.toString() ?? '').trim()
               : '';
 
           if (partNumber.isEmpty) continue;
 
           final description = (colNombre1 != -1 && colNombre1 < row.length)
-              ? row[colNombre1]?.value?.toString().trim() ?? ''
+              ? (row[colNombre1]?.toString() ?? '').trim()
               : '';
           final unit = (colUM != -1 && colUM < row.length)
-              ? row[colUM]?.value?.toString().trim() ?? 'UN'
+              ? (row[colUM]?.toString() ?? '').trim()
               : 'UN';
           final stockStr = (colStockActual != -1 && colStockActual < row.length)
-              ? row[colStockActual]?.value?.toString().trim() ?? '0'
+              ? (row[colStockActual]?.toString() ?? '').trim()
               : '0';
 
           final currentStock = int.tryParse(stockStr) ??
               (double.tryParse(stockStr)?.toInt() ?? 0);
 
           final family = (colFamilia != -1 && colFamilia < row.length)
-              ? row[colFamilia]?.value?.toString().trim() ?? ''
+              ? (row[colFamilia]?.toString() ?? '').trim()
               : '';
           final brand = (colMarca != -1 && colMarca < row.length)
-              ? row[colMarca]?.value?.toString().trim() ?? ''
+              ? (row[colMarca]?.toString() ?? '').trim()
               : '';
 
           parsedItems.add(NewStockItem(
             partNumber: partNumber,
             description: description,
-            unit: unit,
+            unit: unit.isEmpty ? 'UN' : unit,
             currentStock: currentStock,
             family: family,
             brand: brand,
@@ -133,7 +245,8 @@ class _AdminPanelScreenState extends State<AdminPanelScreen> {
       }
 
       if (parsedItems.isNotEmpty) {
-        widget.stockService.loadNewStockItems(parsedItems);
+        await widget.stockService.loadNewStockItems(parsedItems);
+        if (!mounted) return;
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text('✓ Se cargaron ${parsedItems.length} artículos de Stock Nuevos correctamente.'),
@@ -141,6 +254,7 @@ class _AdminPanelScreenState extends State<AdminPanelScreen> {
           ),
         );
       } else {
+        if (!mounted) return;
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
             content: Text('No se encontraron registros válidos en el archivo Excel.'),
@@ -149,6 +263,7 @@ class _AdminPanelScreenState extends State<AdminPanelScreen> {
         );
       }
     } catch (e) {
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text('Error al procesar el Excel: $e'),
@@ -156,7 +271,7 @@ class _AdminPanelScreenState extends State<AdminPanelScreen> {
         ),
       );
     } finally {
-      setState(() => _isUploading = false);
+      if (mounted) setState(() => _isUploadingNewStock = false);
     }
   }
 
@@ -262,14 +377,13 @@ class _AdminPanelScreenState extends State<AdminPanelScreen> {
         ]);
       }
 
-      // Eliminar hoja por defecto si se creó una adicional
       if (excel.tables.containsKey('Sheet1')) {
         excel.delete('Sheet1');
       }
 
       final fileBytes = excel.save();
       if (fileBytes != null) {
-        final String? outputPath = await FilePicker.platform.saveFile(
+        final String? outputPath = await FilePicker.saveFile(
           dialogTitle: 'Guardar Reporte General de Stock',
           fileName: 'Reporte_Stock_Control_${DateTime.now().millisecondsSinceEpoch}.xlsx',
           type: FileType.custom,
@@ -277,7 +391,7 @@ class _AdminPanelScreenState extends State<AdminPanelScreen> {
           bytes: Uint8List.fromList(fileBytes),
         );
 
-        if (outputPath != null) {
+        if (outputPath != null && mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
               content: Text('✓ Reporte Excel exportado con éxito en: $outputPath'),
@@ -287,11 +401,13 @@ class _AdminPanelScreenState extends State<AdminPanelScreen> {
         }
       }
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error al exportar reporte Excel: $e'), backgroundColor: Colors.red),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error al exportar reporte Excel: $e'), backgroundColor: Colors.red),
+        );
+      }
     } finally {
-      setState(() => _isExporting = false);
+      if (mounted) setState(() => _isExporting = false);
     }
   }
 
@@ -365,7 +481,7 @@ class _AdminPanelScreenState extends State<AdminPanelScreen> {
           ),
           const SizedBox(height: 16),
 
-          // SECCIÓN 1: Reportes y Exportación Completa
+          // SECCIÓN 1: Importación Masiva de Catálogo Maestro (P/N Verificados)
           Card(
             elevation: 2,
             child: Padding(
@@ -373,7 +489,43 @@ class _AdminPanelScreenState extends State<AdminPanelScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text('1. Reporte General de Auditoría',
+                  const Text('1. Importar Catálogo Maestro (P/N Verificados)',
+                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                  const SizedBox(height: 4),
+                  const Text(
+                      'Sube el Excel con columnas PN, DESCRIPCION y MODELOS para registrar los repuestos habilitados en la base de datos (sin afectar el stock físico).',
+                      style: TextStyle(fontSize: 12, color: Colors.grey)),
+                  const SizedBox(height: 12),
+                  SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.teal,
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                      ),
+                      onPressed: _isUploadingCatalog ? null : _pickAndImportCatalogExcel,
+                      icon: _isUploadingCatalog
+                          ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+                          : const Icon(Icons.playlist_add_check),
+                      label: Text(_isUploadingCatalog ? 'IMPORTANDO CATÁLOGO...' : 'IMPORTAR EXCEL DE PART NUMBERS (.XLSX)'),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+
+          // SECCIÓN 2: Reportes y Exportación Completa
+          Card(
+            elevation: 2,
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('2. Reporte General de Auditoría',
                       style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
                   const SizedBox(height: 4),
                   const Text('Descarga toda la base de datos, cajones, compras e historial de movimientos en un archivo Excel.',
@@ -400,7 +552,7 @@ class _AdminPanelScreenState extends State<AdminPanelScreen> {
           ),
           const SizedBox(height: 12),
 
-          // SECCIÓN 2: Importación Tango ERP
+          // SECCIÓN 3: Importación Tango ERP
           Card(
             elevation: 2,
             child: Padding(
@@ -408,7 +560,7 @@ class _AdminPanelScreenState extends State<AdminPanelScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text('2. Cargar Excel "Stock Nuevos" (Tango STO2040)',
+                  const Text('3. Cargar Excel "Stock Nuevos" (Tango STO2040)',
                       style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
                   const SizedBox(height: 4),
                   const Text('Sube la planilla de compras para actualizar el catálogo de Stock Nuevos.',
@@ -422,11 +574,11 @@ class _AdminPanelScreenState extends State<AdminPanelScreen> {
                         foregroundColor: Colors.white,
                         padding: const EdgeInsets.symmetric(vertical: 14),
                       ),
-                      onPressed: _isUploading ? null : _pickAndParseExcel,
-                      icon: _isUploading
+                      onPressed: _isUploadingNewStock ? null : _pickAndParseExcel,
+                      icon: _isUploadingNewStock
                           ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
                           : const Icon(Icons.upload_file),
-                      label: Text(_isUploading ? 'PROCESANDO EXCEL...' : 'SUBIR EXCEL DE COMPRAS (.XLSX)'),
+                      label: Text(_isUploadingNewStock ? 'PROCESANDO EXCEL...' : 'SUBIR EXCEL DE COMPRAS (.XLSX)'),
                     ),
                   ),
                 ],
@@ -435,7 +587,7 @@ class _AdminPanelScreenState extends State<AdminPanelScreen> {
           ),
           const SizedBox(height: 12),
 
-          // SECCIÓN 3: Alta Manual en Catálogo
+          // SECCIÓN 4: Alta Manual en Catálogo
           Card(
             elevation: 2,
             child: Padding(
@@ -443,7 +595,7 @@ class _AdminPanelScreenState extends State<AdminPanelScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text('3. Alta Individual en Catálogo (DB)',
+                  const Text('4. Alta Individual en Catálogo (DB)',
                       style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
                   const SizedBox(height: 12),
                   TextField(
@@ -476,7 +628,7 @@ class _AdminPanelScreenState extends State<AdminPanelScreen> {
           ),
           const SizedBox(height: 12),
 
-          // SECCIÓN 4: Gestión de Usuarios (Facu)
+          // SECCIÓN 5: Gestión de Usuarios (Facu)
           if (isAdvanced)
             Card(
               elevation: 2,
@@ -485,7 +637,7 @@ class _AdminPanelScreenState extends State<AdminPanelScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text('4. Gestión de Jerarquía de Usuarios (Facu)',
+                    const Text('5. Gestión de Jerarquía de Usuarios (Facu)',
                         style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
                     const Divider(),
                     ...widget.stockService.users.map((u) {
@@ -500,9 +652,9 @@ class _AdminPanelScreenState extends State<AdminPanelScreen> {
                               child: Text(AppUser(id: '', name: '', role: role).roleDisplayName),
                             );
                           }).toList(),
-                          onChanged: (newRole) {
+                          onChanged: (newRole) async {
                             if (newRole != null) {
-                              widget.stockService.updateUserRole(u.id, newRole);
+                              await widget.stockService.updateUserRole(u.id, newRole);
                               setState(() {});
                             }
                           },

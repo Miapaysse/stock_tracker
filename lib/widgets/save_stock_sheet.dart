@@ -1,564 +1,333 @@
-import 'package:flutter/material.dart' hide Drawer;
-import '../models/drawer.dart';
+import 'package:flutter/material.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
 import '../models/part.dart';
-import '../models/user_role.dart';
 import '../services/firestore_stock_service.dart';
-import 'barcode_scanner_dialog.dart';
 
 class SaveStockSheet extends StatefulWidget {
   final FirestoreStockService stockService;
-  final String currentUser;
 
-  const SaveStockSheet({
-    super.key,
-    required this.stockService,
-    required this.currentUser,
-  });
+  const SaveStockSheet({super.key, required this.stockService});
 
   @override
   State<SaveStockSheet> createState() => _SaveStockSheetState();
 }
 
 class _SaveStockSheetState extends State<SaveStockSheet> {
-  final TextEditingController _searchController = TextEditingController();
+  final _partCodeController = TextEditingController();
+  final _drawerCodeController = TextEditingController();
+
   Part? _selectedPart;
-  Drawer? _selectedDrawer;
+  int? _selectedDrawer;
   int _quantity = 1;
-  bool _showDrawerSelection = false;
-
-  int _pnScanAttempts = 0;
-  bool get _canManualPnInput => _pnScanAttempts >= 3;
-
-  int _drawerScanAttempts = 0;
-  bool get _canManualDrawerInput => _drawerScanAttempts >= 3;
+  bool _isSaving = false;
 
   @override
   void dispose() {
-    _searchController.dispose();
+    _partCodeController.dispose();
+    _drawerCodeController.dispose();
     super.dispose();
   }
 
-  Future<void> _openPnScanner() async {
-    final scannedCode = await Navigator.push<String?>(
-      context,
-      MaterialPageRoute(builder: (_) => const BarcodeScannerDialog(title: '1/2 Escanear Part Number')),
+  /// Abre el escáner de cámara con ciclo de vida controlado para evitar bloqueos en iOS Safari
+  Future<String?> _scanBarcodeWithDialog({required String title}) async {
+    final controller = MobileScannerController(
+      detectionSpeed: DetectionSpeed.noDuplicates,
+      facing: CameraFacing.back,
     );
+    bool hasScanned = false;
 
-    if (scannedCode != null && scannedCode.isNotEmpty) {
-      _processPnCode(scannedCode);
-    } else {
-      _simulatePnFailedScan();
-    }
-  }
-
-  void _processPnCode(String code) {
-    final query = code.trim();
-    if (query.isEmpty) return;
-
-    final found = widget.stockService.findPartByCode(query);
-    if (found != null) {
-      setState(() {
-        _selectedPart = found;
-        _showDrawerSelection = true;
-        _selectedDrawer = null;
-        _drawerScanAttempts = 0;
-      });
-
-      // DISPARA AUTOMÁTICAMENTE EL ESCÁNER DE CAJÓN AL DETECTAR EL REPUESTO
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        _openDrawerScanner();
-      });
-    } else {
-      if (widget.stockService.currentUser.role == UserRole.technician) {
-        _showTechnicianWarningDialog(query);
-      } else {
-        _showAddPartDialog(query);
-      }
-    }
-  }
-
-  Future<void> _openDrawerScanner() async {
-    final scannedCode = await Navigator.push<String?>(
-      context,
-      MaterialPageRoute(builder: (_) => const BarcodeScannerDialog(title: '2/2 Escanear Etiqueta de Cajón')),
-    );
-
-    if (scannedCode != null && scannedCode.isNotEmpty) {
-      _processDrawerCode(scannedCode);
-    } else {
-      _simulateDrawerFailedScan();
-    }
-  }
-
-  void _processDrawerCode(String code) {
-    final numMatch = RegExp(r'\d+').firstMatch(code);
-    if (numMatch != null) {
-      final drawerNum = int.tryParse(numMatch.group(0)!);
-      if (drawerNum != null && drawerNum >= 1 && drawerNum <= 20) {
-        setState(() {
-          _selectedDrawer = Drawer(number: drawerNum);
-        });
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('✓ Cajón $drawerNum escaneado correctamente.'),
-            backgroundColor: Colors.green,
-            duration: const Duration(seconds: 2),
-          ),
-        );
-        return;
-      }
-    }
-
-    _simulateDrawerFailedScan();
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('El código "$code" no corresponde a un cajón válido (1 a 20).'),
-        backgroundColor: Colors.orange,
-      ),
-    );
-  }
-
-  void _simulatePnFailedScan() {
-    setState(() => _pnScanAttempts++);
-  }
-
-  void _simulateDrawerFailedScan() {
-    setState(() => _drawerScanAttempts++);
-  }
-
-  void _showTechnicianWarningDialog(String code) {
-    showDialog(
-      context: context,
-      builder: (dialogContext) {
-        return AlertDialog(
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-          title: const Row(
-            children: [
-              Icon(Icons.warning_amber_rounded, color: Colors.orange, size: 28),
-              SizedBox(width: 8),
-              Text('Part Number No Registrado'),
-            ],
-          ),
-          content: Text('El Part Number "$code" no existe en el catálogo.\n\nComo Técnico no puedes agregar repuestos. Solicita el alta a Gabriel o Facu.'),
-          actions: [
-            ElevatedButton(
-              style: ElevatedButton.styleFrom(backgroundColor: Colors.orange, foregroundColor: Colors.white),
-              onPressed: () => Navigator.pop(dialogContext),
-              child: const Text('Entendido'),
-            ),
-          ],
-        );
-      },
-    );
-  }
-
-  void _showAddPartDialog(String initialCode) {
-    final partNumberController = TextEditingController(text: initialCode);
-    final modelController = TextEditingController();
-    final descriptionController = TextEditingController();
-    final formKey = GlobalKey<FormState>();
-
-    showDialog(
+    final result = await showDialog<String>(
       context: context,
       barrierDismissible: false,
       builder: (dialogContext) {
         return AlertDialog(
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-          title: const Row(
-            children: [
-              Icon(Icons.add_box, color: Colors.blueAccent),
-              SizedBox(width: 8),
-              Text('Alta en Catálogo (Admin)'),
-            ],
-          ),
-          content: SingleChildScrollView(
-            child: Form(
-              key: formKey,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  TextFormField(
-                    controller: partNumberController,
-                    decoration: const InputDecoration(labelText: '1. Part Number *', border: OutlineInputBorder()),
-                    validator: (v) => (v == null || v.trim().isEmpty) ? 'Requerido' : null,
-                  ),
-                  const SizedBox(height: 10),
-                  TextFormField(
-                    controller: modelController,
-                    decoration: const InputDecoration(labelText: '2. Modelo de impresora *', border: OutlineInputBorder()),
-                    validator: (v) => (v == null || v.trim().isEmpty) ? 'Requerido' : null,
-                  ),
-                  const SizedBox(height: 10),
-                  TextFormField(
-                    controller: descriptionController,
-                    decoration: const InputDecoration(labelText: '3. Descripción *', border: OutlineInputBorder()),
-                    validator: (v) => (v == null || v.trim().isEmpty) ? 'Requerido' : null,
-                  ),
-                ],
+          title: Text(title, style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
+          content: SizedBox(
+            width: 300,
+            height: 280,
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(12),
+              child: MobileScanner(
+                controller: controller,
+                onDetect: (capture) {
+                  if (hasScanned) return;
+                  final barcodes = capture.barcodes;
+                  if (barcodes.isNotEmpty && barcodes.first.rawValue != null) {
+                    hasScanned = true;
+                    final code = barcodes.first.rawValue!.trim();
+                    Navigator.of(dialogContext).pop(code);
+                  }
+                },
               ),
             ),
           ),
           actions: [
             TextButton(
-              onPressed: () => Navigator.pop(dialogContext),
+              onPressed: () => Navigator.of(dialogContext).pop(null),
               child: const Text('Cancelar'),
-            ),
-            ElevatedButton(
-              onPressed: () {
-                if (formKey.currentState?.validate() ?? false) {
-                  final newPart = widget.stockService.addPart(
-                    partNumber: partNumberController.text,
-                    compatibleModels: [modelController.text.trim()],
-                    description: descriptionController.text,
-                  );
-                  Navigator.pop(dialogContext);
-                  setState(() {
-                    _selectedPart = newPart;
-                    _showDrawerSelection = true;
-                    _selectedDrawer = null;
-                    _drawerScanAttempts = 0;
-                  });
-                  WidgetsBinding.instance.addPostFrameCallback((_) {
-                    _openDrawerScanner();
-                  });
-                }
-              },
-              child: const Text('Guardar y Pasar a Cajón'),
             ),
           ],
         );
       },
     );
+
+    await controller.dispose();
+    return result;
   }
 
-  void _confirmSave() {
-    if (_selectedPart == null || _selectedDrawer == null || _quantity <= 0) return;
+  Future<void> _scanPartStep() async {
+    final code = await _scanBarcodeWithDialog(title: '1. Escanear Código de Pieza');
+    if (code != null && code.isNotEmpty) {
+      _partCodeController.text = code;
+      _searchPart(code);
+    }
+  }
 
-    widget.stockService.addStock(
-      partId: _selectedPart!.id,
-      drawerNumber: _selectedDrawer!.number,
-      quantity: _quantity,
-      userName: widget.currentUser,
-    );
+  void _searchPart(String code) {
+    final found = widget.stockService.findPartByCode(code);
+    setState(() {
+      _selectedPart = found;
+      _selectedDrawer = null;
+      _drawerCodeController.clear();
+    });
 
-    Navigator.pop(context, true);
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('✓ Guardado: $_quantity ud. de ${_selectedPart!.partNumber} en Cajón ${_selectedDrawer!.number}'),
-        backgroundColor: Colors.green,
-      ),
-    );
+    if (found == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('El Part Number "$code" no figura en el catálogo verificado.'),
+          backgroundColor: Colors.orange,
+        ),
+      );
+    }
+  }
+
+  Future<void> _scanDrawerStep() async {
+    final code = await _scanBarcodeWithDialog(title: '2. Escanear Código de Cajón');
+    if (code != null && code.isNotEmpty) {
+      _drawerCodeController.text = code;
+      _parseDrawerCode(code);
+    }
+  }
+
+  void _parseDrawerCode(String code) {
+    final digits = RegExp(r'\d+').firstMatch(code)?.group(0);
+    final drawerNum = digits != null ? int.tryParse(digits) : null;
+
+    if (drawerNum != null && drawerNum >= 1 && drawerNum <= 20) {
+      setState(() => _selectedDrawer = drawerNum);
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Código de cajón inválido ("$code"). Debe ser entre 1 y 20.'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
+  }
+
+  Future<void> _confirmSave() async {
+    if (_selectedPart == null || _selectedDrawer == null) return;
+    setState(() => _isSaving = true);
+
+    try {
+      await widget.stockService.saveStock(
+        partId: _selectedPart!.id,
+        drawerNumber: _selectedDrawer!,
+        quantity: _quantity,
+      );
+      if (!mounted) return;
+      Navigator.of(context).pop();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('✓ Se ingresaron $_quantity unid. de ${_selectedPart!.partNumber} en Cajón #$_selectedDrawer'),
+          backgroundColor: Colors.green,
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error al guardar: $e'), backgroundColor: Colors.red),
+      );
+    } finally {
+      if (mounted) setState(() => _isSaving = false);
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    final drawerNumbers = widget.stockService.getDrawersForSaving();
-    final stockPerDrawer = _selectedPart != null
-        ? widget.stockService.getStockPerDrawerForPart(_selectedPart!.id)
-        : <int, int>{};
-    final drawersWithStock = drawerNumbers
-        .where((number) => (stockPerDrawer[number] ?? 0) > 0)
-        .map((number) => Drawer(number: number))
-        .toList();
-    final otherDrawers = drawerNumbers
-        .where((number) => (stockPerDrawer[number] ?? 0) == 0)
-        .map((number) => Drawer(number: number))
-        .toList();
+    final availableDrawers = widget.stockService.getDrawersForSaving();
 
     return Padding(
       padding: EdgeInsets.only(
-        bottom: MediaQuery.of(context).viewInsets.bottom + 16,
+        bottom: MediaQuery.of(context).viewInsets.bottom + 20,
+        left: 20,
+        right: 20,
         top: 20,
-        left: 16,
-        right: 16,
       ),
       child: SingleChildScrollView(
         child: Column(
           mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            const Text('Guardar Repuesto en Cajón',
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 16),
+
+            // PASO 1: ESCANEAR O INGRESAR PIEZA
+            const Text('Paso 1: Identificar Repuesto',
+                style: TextStyle(fontWeight: FontWeight.bold, color: Colors.blueAccent)),
+            const SizedBox(height: 8),
             Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                const Row(
-                  children: [
-                    Icon(Icons.archive, color: Colors.green, size: 28),
-                    SizedBox(width: 8),
-                    Text('GUARDAR PIEZA', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-                  ],
+                Expanded(
+                  child: TextField(
+                    controller: _partCodeController,
+                    textCapitalization: TextCapitalization.characters,
+                    decoration: const InputDecoration(
+                      labelText: 'Part Number',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                    onSubmitted: _searchPart,
+                  ),
                 ),
-                IconButton(icon: const Icon(Icons.close), onPressed: () => Navigator.pop(context)),
+                const SizedBox(width: 8),
+                IconButton.filled(
+                  onPressed: () => _searchPart(_partCodeController.text),
+                  icon: const Icon(Icons.search),
+                  tooltip: 'Buscar P/N',
+                ),
+                const SizedBox(width: 6),
+                ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.blueAccent,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                  ),
+                  onPressed: _scanPartStep,
+                  icon: const Icon(Icons.qr_code_scanner),
+                  label: const Text('Escanear Pieza'),
+                ),
               ],
             ),
-            const Divider(),
-            const SizedBox(height: 10),
 
-            // PASO 1: PART NUMBER
-            if (!_showDrawerSelection) ...[
+            // PAUSA DE CONFIRMACIÓN ENTRE ESCANEO DE PIEZA Y ESCANEO DE CAJÓN
+            if (_selectedPart != null) ...[
+              const SizedBox(height: 16),
               Container(
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                  color: _canManualPnInput ? Colors.blue.shade50 : Colors.amber.shade50,
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: _canManualPnInput ? Colors.blue : Colors.amber),
-                ),
-                child: Row(
-                  children: [
-                    Icon(_canManualPnInput ? Icons.lock_open : Icons.qr_code_scanner, 
-                         color: _canManualPnInput ? Colors.blue : Colors.amber.shade900),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: Text(
-                        _canManualPnInput
-                            ? '✓ Teclado manual habilitado para Part Number.'
-                            : 'Paso 1: Escanea el Part Number del repuesto. Fallos: $_pnScanAttempts/3.',
-                        style: TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.bold,
-                          color: _canManualPnInput ? Colors.blue.shade900 : Colors.amber.shade900,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 14),
-
-              ElevatedButton.icon(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.blueAccent,
-                  foregroundColor: Colors.white,
-                  padding: const EdgeInsets.symmetric(vertical: 14),
-                ),
-                onPressed: _openPnScanner,
-                icon: const Icon(Icons.camera_alt),
-                label: const Text('ESCANEAR PART NUMBER', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
-              ),
-              const SizedBox(height: 8),
-
-              if (!_canManualPnInput)
-                OutlinedButton.icon(
-                  onPressed: _simulatePnFailedScan,
-                  icon: const Icon(Icons.warning_amber, color: Colors.orange),
-                  label: Text('Simular Fallo Escaneo PN ($_pnScanAttempts/3)', style: const TextStyle(color: Colors.orange)),
-                ),
-
-              if (_canManualPnInput) ...[
-                const SizedBox(height: 12),
-                TextField(
-                  controller: _searchController,
-                  autofocus: true,
-                  decoration: const InputDecoration(
-                    labelText: 'Ingreso Manual: Part Number',
-                    border: OutlineInputBorder(),
-                  ),
-                  onSubmitted: _processPnCode,
-                ),
-                const SizedBox(height: 10),
-                ElevatedButton.icon(
-                  style: ElevatedButton.styleFrom(backgroundColor: Colors.green, foregroundColor: Colors.white),
-                  onPressed: () => _processPnCode(_searchController.text),
-                  icon: const Icon(Icons.search),
-                  label: const Text('Buscar Manualmente'),
-                ),
-              ],
-            ],
-
-            // PASO 2: CAJÓN OBLIGATORIO
-            if (_showDrawerSelection && _selectedPart != null) ...[
-              Container(
-                padding: const EdgeInsets.all(12),
+                width: double.infinity,
+                padding: const EdgeInsets.all(14),
                 decoration: BoxDecoration(
                   color: Colors.green.shade50,
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: Colors.green.shade200),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.green.shade400),
                 ),
-                child: Row(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text('PN: ${_selectedPart!.partNumber}', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-                          Text(_selectedPart!.description),
-                        ],
-                      ),
-                    ),
-                    TextButton(
-                      onPressed: () => setState(() {
-                        _showDrawerSelection = false;
-                        _selectedPart = null;
-                      }),
-                      child: const Text('Cambiar PN'),
-                    )
-                  ],
-                ),
-              ),
-              const SizedBox(height: 16),
-
-              Container(
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                  color: _selectedDrawer != null
-                      ? Colors.green.shade50
-                      : (_canManualDrawerInput ? Colors.blue.shade50 : Colors.amber.shade50),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(
-                    color: _selectedDrawer != null
-                        ? Colors.green
-                        : (_canManualDrawerInput ? Colors.blue : Colors.amber),
-                  ),
-                ),
-                child: Row(
-                  children: [
-                    Icon(
-                      _selectedDrawer != null
-                          ? Icons.check_circle
-                          : (_canManualDrawerInput ? Icons.lock_open : Icons.qr_code),
-                      color: _selectedDrawer != null
-                          ? Colors.green.shade800
-                          : (_canManualDrawerInput ? Colors.blue : Colors.amber.shade900),
-                    ),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: Text(
-                        _selectedDrawer != null
-                            ? '✓ Cajón ${_selectedDrawer!.number} asignado por escaneo.'
-                            : (_canManualDrawerInput
-                                ? '✓ Selección manual de cajón habilitada (3/3 fallos).'
-                                : 'Paso 2: Debes escanear el código del cajón. Fallos: $_drawerScanAttempts/3.'),
-                        style: TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.bold,
-                          color: _selectedDrawer != null
-                              ? Colors.green.shade900
-                              : (_canManualDrawerInput ? Colors.blue.shade900 : Colors.amber.shade900),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 12),
-
-              ElevatedButton.icon(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.teal,
-                  foregroundColor: Colors.white,
-                  padding: const EdgeInsets.symmetric(vertical: 12),
-                ),
-                onPressed: _openDrawerScanner,
-                icon: const Icon(Icons.qr_code_2),
-                label: Text(
-                  _selectedDrawer != null
-                      ? 'RE-ESCANEAR OTRO CAJÓN'
-                      : 'ABRIR ESCÁNER DE CAJÓN',
-                  style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
-                ),
-              ),
-              const SizedBox(height: 6),
-
-              if (!_canManualDrawerInput && _selectedDrawer == null)
-                OutlinedButton.icon(
-                  onPressed: _simulateDrawerFailedScan,
-                  icon: const Icon(Icons.warning_amber, color: Colors.orange),
-                  label: Text('Simular Fallo Escaneo Cajón ($_drawerScanAttempts/3)', style: const TextStyle(color: Colors.orange)),
-                ),
-
-              // LA GRILLA SOLO APARECE SI SE ESCANEÓ O SI YA HUBO 3 FALLOS
-              if (_canManualDrawerInput || _selectedDrawer != null) ...[
-                const SizedBox(height: 14),
-                if (drawersWithStock.isNotEmpty) ...[
-                  Container(
-                    padding: const EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      color: Colors.amber.shade50,
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(color: Colors.amber.shade300),
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
+                    Row(
                       children: [
-                        const Text('Sugerencia: Cajones con esta pieza', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                        const SizedBox(height: 6),
-                        Wrap(
-                          spacing: 8,
-                          children: drawersWithStock.map((drawer) {
-                            final isSelected = _selectedDrawer?.number == drawer.number;
-                            final qty = stockPerDrawer[drawer.number] ?? 0;
-                            return ChoiceChip(
-                              label: Text('Cajón ${drawer.number} ($qty ud.)'),
-                              selected: isSelected,
-                              onSelected: (selected) => setState(() => _selectedDrawer = selected ? drawer : null),
-                            );
-                          }).toList(),
+                        const Icon(Icons.check_circle, color: Colors.green),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            'Pieza verificada: ${_selectedPart!.partNumber}',
+                            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                          ),
                         ),
                       ],
                     ),
-                  ),
-                  const SizedBox(height: 10),
-                ],
-
-                const Text('Seleccionar manualmente:', style: TextStyle(color: Colors.grey)),
-                const SizedBox(height: 6),
-                SizedBox(
-                  height: 120,
-                  child: GridView.builder(
-                    gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                      crossAxisCount: 5,
-                      childAspectRatio: 1.4,
-                      crossAxisSpacing: 6,
-                      mainAxisSpacing: 6,
+                    const SizedBox(height: 4),
+                    Text(_selectedPart!.description),
+                    if (_selectedPart!.compatibleModels.isNotEmpty)
+                      Text(
+                        'Modelos: ${_selectedPart!.compatibleModels.join(', ')}',
+                        style: const TextStyle(fontSize: 12, color: Colors.black54),
+                      ),
+                    const Divider(height: 20),
+                    const Text(
+                      'Paso 2: ¿Deseas comenzar el escaneo del cajón?',
+                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
                     ),
-                    itemCount: otherDrawers.length,
-                    itemBuilder: (context, index) {
-                      final drawer = otherDrawers[index];
-                      final isSelected = _selectedDrawer?.number == drawer.number;
-                      return InkWell(
-                        onTap: () => setState(() => _selectedDrawer = drawer),
-                        child: Container(
-                          decoration: BoxDecoration(
-                            color: isSelected ? Colors.green : Colors.grey.shade200,
-                            borderRadius: BorderRadius.circular(6),
-                          ),
-                          alignment: Alignment.center,
-                          child: Text('${drawer.number}', style: TextStyle(fontWeight: FontWeight.bold, color: isSelected ? Colors.white : Colors.black)),
+                    const SizedBox(height: 10),
+                    SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.teal,
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(vertical: 12),
                         ),
-                      );
-                    },
-                  ),
+                        onPressed: _scanDrawerStep,
+                        icon: const Icon(Icons.qr_code_scanner),
+                        label: Text(_selectedDrawer == null
+                            ? 'COMENZAR ESCANEO DE CAJÓN'
+                            : 'VOLVER A ESCANEAR CAJÓN (#$_selectedDrawer)'),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    DropdownButtonFormField<int>(
+                      value: _selectedDrawer,
+                      decoration: const InputDecoration(
+                        labelText: 'O seleccionar Cajón manualmente',
+                        filled: true,
+                        fillColor: Colors.white,
+                        border: OutlineInputBorder(),
+                        isDense: true,
+                      ),
+                      items: availableDrawers
+                          .map((d) => DropdownMenuItem(value: d, child: Text('Cajón #$d')))
+                          .toList(),
+                      onChanged: (val) => setState(() => _selectedDrawer = val),
+                    ),
+                  ],
                 ),
-              ],
+              ),
+            ],
 
+            // PASO 3: CANTIDAD Y GUARDADO
+            if (_selectedPart != null && _selectedDrawer != null) ...[
               const SizedBox(height: 16),
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  const Text('Cantidad a guardar:', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                  const Text('Cantidad a ingresar:',
+                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
                   Row(
                     children: [
-                      IconButton.filledTonal(
+                      IconButton(
                         onPressed: _quantity > 1 ? () => setState(() => _quantity--) : null,
-                        icon: const Icon(Icons.remove),
+                        icon: const Icon(Icons.remove_circle_outline),
                       ),
-                      Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 16),
-                        child: Text('$_quantity', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-                      ),
-                      IconButton.filledTonal(
+                      Text('$_quantity',
+                          style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                      IconButton(
                         onPressed: () => setState(() => _quantity++),
-                        icon: const Icon(Icons.add),
+                        icon: const Icon(Icons.add_circle_outline),
                       ),
                     ],
-                  )
+                  ),
                 ],
               ),
-
-              const SizedBox(height: 20),
-              ElevatedButton(
-                style: ElevatedButton.styleFrom(backgroundColor: Colors.green, foregroundColor: Colors.white, padding: const EdgeInsets.symmetric(vertical: 16)),
-                onPressed: _selectedDrawer != null ? _confirmSave : null,
-                child: const Text('CONFIRMAR GUARDADO', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 12),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.green,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                  ),
+                  onPressed: _isSaving ? null : _confirmSave,
+                  icon: _isSaving
+                      ? const SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
+                        )
+                      : const Icon(Icons.check),
+                  label: Text(_isSaving ? 'GUARDANDO...' : 'CONFIRMAR INGRESO'),
+                ),
               ),
             ],
           ],

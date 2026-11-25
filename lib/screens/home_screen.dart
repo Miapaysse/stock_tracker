@@ -27,7 +27,6 @@ class _HomeScreenState extends State<HomeScreen> {
       isScrollControlled: true,
       builder: (_) => SaveStockSheet(
         stockService: widget.stockService,
-        currentUser: widget.stockService.currentUser.name,
       ),
     );
     if (result == true) setState(() {});
@@ -39,7 +38,6 @@ class _HomeScreenState extends State<HomeScreen> {
       isScrollControlled: true,
       builder: (_) => WithdrawStockSheet(
         stockService: widget.stockService,
-        currentUser: widget.stockService.currentUser.name,
       ),
     );
     if (result == true) setState(() {});

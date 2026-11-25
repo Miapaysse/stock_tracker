@@ -6,10 +6,21 @@ import 'screens/home_screen.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await Firebase.initializeApp(
-    options: DefaultFirebaseOptions.currentPlatform,
-  );
-  runApp(const StockTrackerApp());
+  try {
+    await Firebase.initializeApp(
+      options: DefaultFirebaseOptions.currentPlatform,
+    );
+    runApp(const StockTrackerApp());
+  } catch (e, stack) {
+    runApp(MaterialApp(
+      home: Scaffold(
+        body: Padding(
+          padding: const EdgeInsets.all(24),
+          child: SelectableText('Error al iniciar Firebase:\n$e\n\n$stack'),
+        ),
+      ),
+    ));
+  }
 }
 
 class StockTrackerApp extends StatefulWidget {

@@ -1,167 +1,149 @@
-import 'package:flutter/material.dart' hide Drawer;
-import '../models/drawer.dart';
+import 'package:flutter/material.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
 import '../models/part.dart';
 import '../services/firestore_stock_service.dart';
-import 'barcode_scanner_dialog.dart';
 
 class WithdrawStockSheet extends StatefulWidget {
   final FirestoreStockService stockService;
-  final String currentUser;
 
-  const WithdrawStockSheet({
-    super.key,
-    required this.stockService,
-    required this.currentUser,
-  });
+  const WithdrawStockSheet({super.key, required this.stockService});
 
   @override
   State<WithdrawStockSheet> createState() => _WithdrawStockSheetState();
 }
 
 class _WithdrawStockSheetState extends State<WithdrawStockSheet> {
-  final TextEditingController _searchController = TextEditingController();
+  final _partCodeController = TextEditingController();
+
   Part? _selectedPart;
-  Drawer? _selectedDrawer;
-  int _availableInSelectedDrawer = 0;
+  int? _selectedDrawer;
   int _quantity = 1;
-  bool _showDrawerSelection = false;
-
-  int _pnScanAttempts = 0;
-  bool get _canManualPnInput => _pnScanAttempts >= 3;
-
-  int _drawerScanAttempts = 0;
-  bool get _canManualDrawerInput => _drawerScanAttempts >= 3;
 
   @override
   void dispose() {
-    _searchController.dispose();
+    _partCodeController.dispose();
     super.dispose();
   }
 
-  Future<void> _openPnScanner() async {
-    final scannedCode = await Navigator.push<String?>(
-      context,
-      MaterialPageRoute(builder: (_) => const BarcodeScannerDialog(title: '1/2 Escanear Part Number A Retirar')),
+  /// Abre el escáner de cámara con ciclo de vida controlado para evitar bloqueos en iOS Safari
+  Future<String?> _scanBarcodeWithDialog({required String title}) async {
+    final controller = MobileScannerController(
+      detectionSpeed: DetectionSpeed.noDuplicates,
+      facing: CameraFacing.back,
+    );
+    bool hasScanned = false;
+
+    final result = await showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: Text(title, style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
+          content: SizedBox(
+            width: 300,
+            height: 280,
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(12),
+              child: MobileScanner(
+                controller: controller,
+                onDetect: (capture) {
+                  if (hasScanned) return;
+                  final barcodes = capture.barcodes;
+                  if (barcodes.isNotEmpty && barcodes.first.rawValue != null) {
+                    hasScanned = true;
+                    final code = barcodes.first.rawValue!.trim();
+                    Navigator.of(dialogContext).pop(code);
+                  }
+                },
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(null),
+              child: const Text('Cancelar'),
+            ),
+          ],
+        );
+      },
     );
 
-    if (scannedCode != null && scannedCode.isNotEmpty) {
-      _processPnCode(scannedCode);
-    } else {
-      _simulatePnFailedScan();
+    await controller.dispose();
+    return result;
+  }
+
+  Future<void> _scanPartStep() async {
+    final code = await _scanBarcodeWithDialog(title: '1. Escanear Pieza a Retirar');
+    if (code != null && code.isNotEmpty) {
+      _partCodeController.text = code;
+      _searchPart(code);
     }
   }
 
-  void _processPnCode(String code) {
-    final query = code.trim();
-    if (query.isEmpty) return;
+  void _searchPart(String code) {
+    final found = widget.stockService.findPartByCode(code);
+    setState(() {
+      _selectedPart = found;
+      _selectedDrawer = null;
+      _quantity = 1;
+    });
 
-    final found = widget.stockService.findPartByCode(query);
-    if (found != null) {
-      final availableMap = widget.stockService.getAvailableDrawersForWithdrawal(found.id);
-      if (availableMap.isEmpty) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('La pieza ${found.partNumber} no tiene stock en ningún cajón.'),
-            backgroundColor: Colors.red,
-          ),
-        );
-        return;
-      }
-      setState(() {
-        _selectedPart = found;
-        _showDrawerSelection = true;
-        _selectedDrawer = null;
-        _drawerScanAttempts = 0;
-      });
-
-      // DISPARA AUTOMÁTICAMENTE EL ESCÁNER DE CAJÓN AL DETECTAR EL REPUESTO
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        _openDrawerScanner();
-      });
-    } else {
+    if (found == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('No se encontró repuesto con código "$query"'),
+          content: Text('El Part Number "$code" no figura en el catálogo.'),
           backgroundColor: Colors.orange,
         ),
       );
     }
   }
 
-  Future<void> _openDrawerScanner() async {
-    final scannedCode = await Navigator.push<String?>(
-      context,
-      MaterialPageRoute(builder: (_) => const BarcodeScannerDialog(title: '2/2 Escanear Etiqueta de Cajón')),
-    );
+  Future<void> _scanDrawerStep() async {
+    if (_selectedPart == null) return;
+    final code = await _scanBarcodeWithDialog(title: '2. Escanear Cajón de Origen');
+    if (code != null && code.isNotEmpty) {
+      final digits = RegExp(r'\d+').firstMatch(code)?.group(0);
+      final drawerNum = digits != null ? int.tryParse(digits) : null;
+      final availableMap = widget.stockService.getAvailableDrawersForWithdrawal(_selectedPart!.id);
 
-    if (scannedCode != null && scannedCode.isNotEmpty) {
-      _processDrawerCode(scannedCode);
-    } else {
-      _simulateDrawerFailedScan();
-    }
-  }
-
-  void _processDrawerCode(String code) {
-    final numMatch = RegExp(r'\d+').firstMatch(code);
-    if (numMatch != null && _selectedPart != null) {
-      final drawerNum = int.tryParse(numMatch.group(0)!);
-      final availableDrawers = widget.stockService.getAvailableDrawersForWithdrawal(_selectedPart!.id);
-
-      if (drawerNum != null && availableDrawers.containsKey(drawerNum)) {
+      if (drawerNum != null && availableMap.containsKey(drawerNum)) {
         setState(() {
-          _selectedDrawer = Drawer(number: drawerNum);
-          _availableInSelectedDrawer = availableDrawers[drawerNum]!;
+          _selectedDrawer = drawerNum;
           _quantity = 1;
         });
+      } else {
+        if (!mounted) return;
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('✓ Cajón $drawerNum escaneado ($_availableInSelectedDrawer ud. disponibles).'),
-            backgroundColor: Colors.green,
+            content: Text('No hay stock de ${_selectedPart!.partNumber} en el cajón "$code".'),
+            backgroundColor: Colors.red,
           ),
         );
-        return;
       }
     }
-
-    _simulateDrawerFailedScan();
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('El cajón "$code" no posee stock registrado de esta pieza.'),
-        backgroundColor: Colors.orange,
-      ),
-    );
   }
 
-  void _simulatePnFailedScan() {
-    setState(() => _pnScanAttempts++);
-  }
-
-  void _simulateDrawerFailedScan() {
-    setState(() => _drawerScanAttempts++);
-  }
-
-  void _confirmWithdraw() {
-    if (_selectedPart == null || _selectedDrawer == null || _quantity <= 0) return;
+  void _confirmWithdrawal() {
+    if (_selectedPart == null || _selectedDrawer == null) return;
 
     final success = widget.stockService.withdrawStock(
       partId: _selectedPart!.id,
-      drawerNumber: _selectedDrawer!.number,
+      drawerNumber: _selectedDrawer!,
       quantity: _quantity,
-      userName: widget.currentUser,
     );
 
     if (success) {
-      Navigator.pop(context, true);
+      Navigator.of(context).pop();
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('✓ Retirado: $_quantity ud. de ${_selectedPart!.partNumber} del Cajón ${_selectedDrawer!.number}'),
-          backgroundColor: Colors.deepOrange,
+          content: Text('✓ Retiradas $_quantity unid. de ${_selectedPart!.partNumber} del Cajón #$_selectedDrawer'),
+          backgroundColor: Colors.green,
         ),
       );
     } else {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('Error: No se puede retirar más de lo disponible.'),
+          content: Text('Stock insuficiente en el cajón seleccionado.'),
           backgroundColor: Colors.red,
         ),
       );
@@ -174,273 +156,178 @@ class _WithdrawStockSheetState extends State<WithdrawStockSheet> {
         ? widget.stockService.getAvailableDrawersForWithdrawal(_selectedPart!.id)
         : <int, int>{};
 
+    final maxAvailable = (_selectedDrawer != null) ? (availableDrawers[_selectedDrawer!] ?? 0) : 0;
+
     return Padding(
       padding: EdgeInsets.only(
-        bottom: MediaQuery.of(context).viewInsets.bottom + 16,
+        bottom: MediaQuery.of(context).viewInsets.bottom + 20,
+        left: 20,
+        right: 20,
         top: 20,
-        left: 16,
-        right: 16,
       ),
       child: SingleChildScrollView(
         child: Column(
           mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            const Text('Retirar Repuesto de Cajón',
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 16),
+
+            // PASO 1: IDENTIFICAR PIEZA
+            const Text('Paso 1: Identificar Repuesto',
+                style: TextStyle(fontWeight: FontWeight.bold, color: Colors.deepOrange)),
+            const SizedBox(height: 8),
             Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                const Row(
-                  children: [
-                    Icon(Icons.unarchive, color: Colors.deepOrange, size: 28),
-                    SizedBox(width: 8),
-                    Text('RETIRAR PIEZA', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-                  ],
+                Expanded(
+                  child: TextField(
+                    controller: _partCodeController,
+                    textCapitalization: TextCapitalization.characters,
+                    decoration: const InputDecoration(
+                      labelText: 'Part Number',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                    onSubmitted: _searchPart,
+                  ),
                 ),
-                IconButton(icon: const Icon(Icons.close), onPressed: () => Navigator.pop(context)),
+                const SizedBox(width: 8),
+                IconButton.filled(
+                  onPressed: () => _searchPart(_partCodeController.text),
+                  icon: const Icon(Icons.search),
+                  tooltip: 'Buscar P/N',
+                ),
+                const SizedBox(width: 6),
+                ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.deepOrange,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                  ),
+                  onPressed: _scanPartStep,
+                  icon: const Icon(Icons.qr_code_scanner),
+                  label: const Text('Escanear Pieza'),
+                ),
               ],
             ),
-            const Divider(),
-            const SizedBox(height: 10),
 
-            // PASO 1: PART NUMBER
-            if (!_showDrawerSelection) ...[
+            // PAUSA DE CONFIRMACIÓN ENTRE ESCANEO DE PIEZA Y ESCANEO DE CAJÓN
+            if (_selectedPart != null) ...[
+              const SizedBox(height: 16),
               Container(
-                padding: const EdgeInsets.all(10),
+                width: double.infinity,
+                padding: const EdgeInsets.all(14),
                 decoration: BoxDecoration(
-                  color: _canManualPnInput ? Colors.blue.shade50 : Colors.amber.shade50,
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: _canManualPnInput ? Colors.blue : Colors.amber),
+                  color: Colors.orange.shade50,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.orange.shade400),
                 ),
-                child: Row(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Icon(_canManualPnInput ? Icons.lock_open : Icons.qr_code_scanner, 
-                         color: _canManualPnInput ? Colors.blue : Colors.amber.shade900),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: Text(
-                        _canManualPnInput
-                            ? '✓ Teclado manual habilitado para Part Number.'
-                            : 'Paso 1: Escanea el Part Number. Fallos: $_pnScanAttempts/3.',
-                        style: TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.bold,
-                          color: _canManualPnInput ? Colors.blue.shade900 : Colors.amber.shade900,
-                        ),
+                    Text(
+                      'Pieza: ${_selectedPart!.partNumber} — ${_selectedPart!.description}',
+                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      availableDrawers.isEmpty
+                          ? 'Sin stock físico disponible en cajones.'
+                          : 'Disponible en: ${availableDrawers.entries.map((e) => 'Cajón #${e.key} (${e.value} u.)').join(', ')}',
+                      style: TextStyle(
+                        fontSize: 13,
+                        color: availableDrawers.isEmpty ? Colors.red : Colors.black87,
+                        fontWeight: FontWeight.w500,
                       ),
                     ),
+                    if (availableDrawers.isNotEmpty) ...[
+                      const Divider(height: 20),
+                      const Text(
+                        'Paso 2: ¿Deseas comenzar el escaneo del cajón?',
+                        style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+                      ),
+                      const SizedBox(height: 10),
+                      SizedBox(
+                        width: double.infinity,
+                        child: ElevatedButton.icon(
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.teal,
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(vertical: 12),
+                          ),
+                          onPressed: _scanDrawerStep,
+                          icon: const Icon(Icons.qr_code_scanner),
+                          label: Text(_selectedDrawer == null
+                              ? 'COMENZAR ESCANEO DE CAJÓN'
+                              : 'VOLVER A ESCANEAR CAJÓN (#$_selectedDrawer)'),
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      DropdownButtonFormField<int>(
+                        value: _selectedDrawer,
+                        decoration: const InputDecoration(
+                          labelText: 'O seleccionar Cajón manualmente',
+                          filled: true,
+                          fillColor: Colors.white,
+                          border: OutlineInputBorder(),
+                          isDense: true,
+                        ),
+                        items: availableDrawers.entries
+                            .map((e) => DropdownMenuItem(
+                                  value: e.key,
+                                  child: Text('Cajón #${e.key} (Disp: ${e.value})'),
+                                ))
+                            .toList(),
+                        onChanged: (val) => setState(() {
+                          _selectedDrawer = val;
+                          _quantity = 1;
+                        }),
+                      ),
+                    ],
                   ],
                 ),
               ),
-              const SizedBox(height: 14),
-
-              ElevatedButton.icon(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.deepOrange,
-                  foregroundColor: Colors.white,
-                  padding: const EdgeInsets.symmetric(vertical: 14),
-                ),
-                onPressed: _openPnScanner,
-                icon: const Icon(Icons.camera_alt),
-                label: const Text('ESCANEAR PART NUMBER', style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
-              ),
-              const SizedBox(height: 8),
-
-              if (!_canManualPnInput)
-                OutlinedButton.icon(
-                  onPressed: _simulatePnFailedScan,
-                  icon: const Icon(Icons.warning_amber, color: Colors.orange),
-                  label: Text('Simular Fallo Escaneo PN ($_pnScanAttempts/3)', style: const TextStyle(color: Colors.orange)),
-                ),
-
-              if (_canManualPnInput) ...[
-                const SizedBox(height: 12),
-                TextField(
-                  controller: _searchController,
-                  autofocus: true,
-                  decoration: const InputDecoration(
-                    labelText: 'Ingreso Manual: Part Number',
-                    border: OutlineInputBorder(),
-                  ),
-                  onSubmitted: _processPnCode,
-                ),
-                const SizedBox(height: 10),
-                ElevatedButton.icon(
-                  style: ElevatedButton.styleFrom(backgroundColor: Colors.deepOrange, foregroundColor: Colors.white),
-                  onPressed: () => _processPnCode(_searchController.text),
-                  icon: const Icon(Icons.search),
-                  label: const Text('Buscar Pieza a Retirar'),
-                ),
-              ],
             ],
 
-            // PASO 2: CAJÓN OBLIGATORIO
-            if (_showDrawerSelection && _selectedPart != null) ...[
-              Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: Colors.deepOrange.shade50,
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: Colors.deepOrange.shade200),
-                ),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text('PN: ${_selectedPart!.partNumber}', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-                          Text(_selectedPart!.description),
-                        ],
-                      ),
-                    ),
-                    TextButton(
-                      onPressed: () => setState(() {
-                        _showDrawerSelection = false;
-                        _selectedPart = null;
-                      }),
-                      child: const Text('Cambiar PN'),
-                    )
-                  ],
-                ),
-              ),
+            // PASO 3: CANTIDAD Y RETIRO
+            if (_selectedPart != null && _selectedDrawer != null && maxAvailable > 0) ...[
               const SizedBox(height: 16),
-
-              Container(
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                  color: _selectedDrawer != null
-                      ? Colors.green.shade50
-                      : (_canManualDrawerInput ? Colors.blue.shade50 : Colors.amber.shade50),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(
-                    color: _selectedDrawer != null
-                        ? Colors.green
-                        : (_canManualDrawerInput ? Colors.blue : Colors.amber),
-                  ),
-                ),
-                child: Row(
-                  children: [
-                    Icon(
-                      _selectedDrawer != null
-                          ? Icons.check_circle
-                          : (_canManualDrawerInput ? Icons.lock_open : Icons.qr_code),
-                      color: _selectedDrawer != null
-                          ? Colors.green.shade800
-                          : (_canManualDrawerInput ? Colors.blue : Colors.amber.shade900),
-                    ),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: Text(
-                        _selectedDrawer != null
-                            ? '✓ Cajón ${_selectedDrawer!.number} asignado por escaneo.'
-                            : (_canManualDrawerInput
-                                ? '✓ Selección manual de cajón habilitada (3/3 fallos).'
-                                : 'Paso 2: Debes escanear el código del cajón. Fallos: $_drawerScanAttempts/3.'),
-                        style: TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.bold,
-                          color: _selectedDrawer != null
-                              ? Colors.green.shade900
-                              : (_canManualDrawerInput ? Colors.blue.shade900 : Colors.amber.shade900),
-                        ),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text('Cantidad a retirar (Máx: $maxAvailable):',
+                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                  Row(
+                    children: [
+                      IconButton(
+                        onPressed: _quantity > 1 ? () => setState(() => _quantity--) : null,
+                        icon: const Icon(Icons.remove_circle_outline),
                       ),
-                    ),
-                  ],
-                ),
+                      Text('$_quantity',
+                          style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                      IconButton(
+                        onPressed: _quantity < maxAvailable ? () => setState(() => _quantity++) : null,
+                        icon: const Icon(Icons.add_circle_outline),
+                      ),
+                    ],
+                  ),
+                ],
               ),
               const SizedBox(height: 12),
-
-              ElevatedButton.icon(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.teal,
-                  foregroundColor: Colors.white,
-                  padding: const EdgeInsets.symmetric(vertical: 12),
-                ),
-                onPressed: _openDrawerScanner,
-                icon: const Icon(Icons.qr_code_2),
-                label: Text(
-                  _selectedDrawer != null
-                      ? 'RE-ESCANEAR OTRO CAJÓN'
-                      : 'ABRIR ESCÁNER DE CAJÓN',
-                  style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.deepOrange,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                  ),
+                  onPressed: _confirmWithdrawal,
+                  icon: const Icon(Icons.outbox),
+                  label: const Text('CONFIRMAR RETIRO'),
                 ),
               ),
-              const SizedBox(height: 6),
-
-              if (!_canManualDrawerInput && _selectedDrawer == null)
-                OutlinedButton.icon(
-                  onPressed: _simulateDrawerFailedScan,
-                  icon: const Icon(Icons.warning_amber, color: Colors.orange),
-                  label: Text('Simular Fallo Escaneo Cajón ($_drawerScanAttempts/3)', style: const TextStyle(color: Colors.orange)),
-                ),
-
-              // LA LISTA DE CAJONES SOLO APARECE SI SE ESCANEÓ O SI YA HUBO 3 FALLOS
-              if (_canManualDrawerInput || _selectedDrawer != null) ...[
-                const SizedBox(height: 14),
-                const Text('Seleccionar manualmente:', style: TextStyle(color: Colors.grey)),
-                const SizedBox(height: 6),
-                Column(
-                  children: availableDrawers.entries.map((entry) {
-                    final drawer = Drawer(number: entry.key);
-                    final availableQty = entry.value;
-                    final isSelected = _selectedDrawer?.number == drawer.number;
-
-                    return Card(
-                      color: isSelected ? Colors.deepOrange.shade100 : Colors.white,
-                      child: ListTile(
-                        leading: CircleAvatar(
-                          backgroundColor: isSelected ? Colors.deepOrange : Colors.grey.shade300,
-                          foregroundColor: isSelected ? Colors.white : Colors.black,
-                          child: Text('${drawer.number}'),
-                        ),
-                        title: Text('Cajón ${drawer.number}', style: const TextStyle(fontWeight: FontWeight.bold)),
-                        subtitle: Text('Disponible: $availableQty unidades'),
-                        onTap: () {
-                          setState(() {
-                            _selectedDrawer = drawer;
-                            _availableInSelectedDrawer = availableQty;
-                            _quantity = 1;
-                          });
-                        },
-                      ),
-                    );
-                  }).toList(),
-                ),
-              ],
-
-              if (_selectedDrawer != null) ...[
-                const SizedBox(height: 16),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    const Text('Cantidad a retirar:', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
-                    Row(
-                      children: [
-                        IconButton.filledTonal(
-                          onPressed: _quantity > 1 ? () => setState(() => _quantity--) : null,
-                          icon: const Icon(Icons.remove),
-                        ),
-                        Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 16),
-                          child: Text('$_quantity', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-                        ),
-                        IconButton.filledTonal(
-                          onPressed: _quantity < _availableInSelectedDrawer ? () => setState(() => _quantity++) : null,
-                          icon: const Icon(Icons.add),
-                        ),
-                      ],
-                    )
-                  ],
-                ),
-                Text('Máximo en este cajón: $_availableInSelectedDrawer', textAlign: TextAlign.end, style: const TextStyle(color: Colors.grey, fontSize: 12)),
-
-                const SizedBox(height: 20),
-                ElevatedButton(
-                  style: ElevatedButton.styleFrom(backgroundColor: Colors.deepOrange, foregroundColor: Colors.white, padding: const EdgeInsets.symmetric(vertical: 16)),
-                  onPressed: _quantity <= _availableInSelectedDrawer ? _confirmWithdraw : null,
-                  child: const Text('CONFIRMAR RETIRO', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-                ),
-              ],
             ],
           ],
         ),
